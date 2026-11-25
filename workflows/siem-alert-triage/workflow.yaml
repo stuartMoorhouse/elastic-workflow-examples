@@ -1,0 +1,205 @@
+# SIEM Alert Triage
+#
+# Source: elastic-security-ai-rule-creation-demo / elastic-agent-builder-workflow-siem-demo
+# (archive/terraform-other/workflows/alert-triage.yaml)
+#
+# WHAT THIS DOES
+# A SIEM detection rule fires this workflow as its connector action. The workflow
+# asks an AI agent to identify the likely vulnerability behind the alert, has a
+# second agent turn that into an osquery SQL query, runs that query against every
+# Fleet-enrolled endpoint via an osquery live query, pulls the per-host results
+# back out of the osquery result index, has a third agent write an incident
+# report from all of the above, and files the report as an Elastic Security Case.
+#
+# PREREQUISITES — nothing in this file will run without these:
+#
+# 1. Agent Builder agents (Kibana > Agent Builder) with exactly these ids, each
+#    pointed at an LLM connector:
+#      - alert-analyzer      Given an alert document, identifies the likely
+#                             CVE/vulnerability and names it in free text.
+#      - osquery-generator    Given the vulnerability analysis text, returns a
+#                             single raw osquery SQL string (no markdown fences).
+#      - report-writer        Given alert + analysis + query + fleet results,
+#                             writes a Markdown incident report. Needs a report
+#                             template in its instructions/prompt.
+#
+# 2. consts.connector_id / consts.agent_policy_id must be filled in:
+#      - agent_policy_id: the Fleet agent policy whose enrolled hosts should be
+#        scanned (Kibana > Fleet > Agent policies).
+#      - connector_id: left blank in the source; not referenced by any step here,
+#        safe to remove unless a downstream step needs it.
+#
+# 3. Fleet + osquery: at least one agent enrolled under agent_policy_id, with the
+#    Osquery Manager integration installed. This creates the
+#    `logs-osquery_manager.result-default` data stream automatically — no manual
+#    index/mapping setup needed, but the query in `fetch_fleet_results` assumes
+#    the standard osquery_manager field set (host.name, osquery.path, action_id,
+#    @timestamp). If you haven't run a live query before, Kibana > Fleet will
+#    walk you through enabling osquery on the policy.
+#
+# 4. Elastic Security must be enabled (for `kibana.createCaseDefaultSpace`,
+#    owner: securitySolution) with a space that has Cases turned on.
+#
+# TRIGGER / SAMPLE INPUT
+# Trigger type is `alert`, so Kibana supplies `event.alerts` from the detection
+# rule that calls this workflow as an action. For a manual/API test run, pass an
+# equivalent shape as `inputs.alerts`:
+#
+#   inputs:
+#     alerts:
+#       - _id: "a1b2c3"
+#         _index: ".alerts-security.alerts-default"
+#         kibana.alert.rule.name: "Known Vulnerable Service Exposed"
+#         kibana.alert.reason: "service sshd 7.2p2 on host-01 matches CVE-2023-..."
+#         host.name: "host-01"
+#         "@timestamp": "2026-11-20T10:00:00.000Z"
+#
+# A TEMPORARY DEBUG STEP (`debug_report_output`) is left in from the original —
+# remove it once you've confirmed `generate_report.output` is populated.
+
+name: SIEM Alert Triage
+enabled: true
+description: >
+  Triggered by connected Elastic SIEM rules. Sends the alert to an
+  Agent to identify the likely vulnerability, generates an osquery to scan
+  the other hosts for that vulnerability, produces a report, it and
+  creates an Elastic Security Case.
+
+
+triggers:
+  - type: alert
+
+consts:
+  alert_analyzer_id: "alert-analyzer"    # Agent for CVE/vulnerability analysis
+  osquery_generator_id: "osquery-generator"  # Agent for osquery SQL generation
+  report_writer_id: "report-writer"    # Agent for incident report generation
+  connector_id: ""
+  agent_policy_id: ""
+
+steps:
+  # ==========================================================================
+  # STEP 1: Alert Analyzer Agent — Identify the vulnerability
+  # ==========================================================================
+  - name: analyze_alert
+    type: ai.agent
+    with:
+      agent_id: "{{ consts.alert_analyzer_id }}"
+      message: |
+        Alert data:
+        {{ inputs.alerts[0] | default: event.alerts[0] | json }}
+    timeout: 5m
+
+  # ==========================================================================
+  # STEP 2:  Osquery Agent— Generate an osquery to detect the vulnerability
+  # ==========================================================================
+  - name: generate_osquery
+    type: ai.agent
+    with:
+      agent_id: "{{ consts.osquery_generator_id }}"
+      message: |
+        Vulnerability analysis:
+        {{ steps.analyze_alert.output.response.message }}
+
+        Return ONLY the raw SQL query — no markdown, no explanation.
+    timeout: 3m
+
+  # ==========================================================================
+  # STEP 3: Run the osquery across the full fleet
+  # ==========================================================================
+  # Resolve the policy to its enrolled agent IDs. Dispatching by
+  # agent_policy_ids makes Fleet reference the query via a policy update
+  # that agents pick up on their next check-in, which races the action
+  # delivery and fails with "missing query: invalid action request".
+  # Dispatching by agent_ids embeds the SQL directly in the action, so
+  # agents can run it immediately without waiting on policy propagation.
+  - name: get_agents
+    type: kibana.request
+    with:
+      method: GET
+      path: >-
+        /api/fleet/agents?kuery={{ 'policy_id:"' | append: consts.agent_policy_id | append: '" and active:true' | url_encode }}
+
+  - name: run_fleet_query
+    type: kibana.request
+    with:
+      method: POST
+      path: /api/osquery/live_queries
+      body:
+        query: "{{ steps.generate_osquery.output.response.message | remove: '```sql' | remove: '```' | strip }}"
+        agent_ids: "${{ steps.get_agents.output.items | map: 'id' }}"
+        timeout: 300
+
+  # Wait for osquery to complete across all agents
+  - name: wait_for_osquery
+    type: wait
+    with:
+      duration: 20s
+
+  # Fetch final osquery results
+  - name: get_final_results
+    type: kibana.request
+    with:
+      method: GET
+      path: "/api/osquery/live_queries/{{ steps.run_fleet_query.output.data.action_id }}"
+
+  # Fetch fleet results from ES index
+  - name: fetch_fleet_results
+    type: elasticsearch.esql.query
+    with:
+      format: json
+      query: >
+        FROM logs-osquery_manager.result-default
+        | WHERE action_id == "{{ steps.run_fleet_query.output.data.queries[0].action_id }}"
+        | KEEP host.name, osquery.path, action_id, @timestamp
+
+  # ==========================================================================
+  # STEP 4: Report Writer Agent — Produce the final report
+  # ==========================================================================
+  - name: generate_report
+    type: ai.agent
+    with:
+      agent_id: "{{ consts.report_writer_id }}"
+      message: |
+        Write a security incident report using the template in your instructions.
+
+        SOURCE ALERT DATA:
+        {{ inputs.alerts[0] | default: event.alerts[0] | json }}
+
+        VULNERABILITY ANALYSIS:
+        {{ steps.analyze_alert.output.response.message }}
+
+        OSQUERY USED:
+        {{ steps.generate_osquery.output.response.message | remove: '```sql' | remove: '```' | strip }}
+
+        FLEET SCAN RESULTS (all monitored hosts):
+        Columns: {{ steps.fetch_fleet_results.output.columns | json }}
+        Values: {{ steps.fetch_fleet_results.output.values | json }}
+    timeout: 5m
+
+  # TEMPORARY DEBUG STEP — remove after diagnosing empty-description bug
+  - name: debug_report_output
+    type: console
+    with:
+      message: "DEBUG generate_report.output = {{ steps.generate_report.output | json }}"
+
+  # ==========================================================================
+  # STEP 5: Create an Elastic Security Case from the report
+  # ==========================================================================
+  - name: create_case
+    type: kibana.createCaseDefaultSpace
+    with:
+      owner: securitySolution
+      title: "Defend Alert Triage: {{ event.alerts[0]['kibana.alert.rule.name'] | default: inputs.alerts[0]['kibana.alert.rule.name'] }}"
+      description: "{{ steps.generate_report.output.response.message | strip }}"
+      severity: high
+      tags:
+        - automated
+        - alert-triage
+        - workflow
+      connector:
+        id: none
+        name: none
+        type: .none
+        fields: null
+      settings:
+        syncAlerts: true

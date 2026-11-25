@@ -1,0 +1,303 @@
+# Reaper Red Team Pipeline
+#
+# Source: reaper (config/workflow-pipeline.yaml)
+#
+# WHAT THIS DOES
+# A full automated kill-chain: NMAP recon -> Nuclei vuln scan -> Hydra
+# credential brute-force -> an AI attack-planner agent picks an exploitation
+# strategy -> Metasploit gets initial access -> (if not already root) LinPEAS
+# enumerates privesc vectors -> an AI privesc-planner agent recommends a path
+# -> Metasploit escalates to root -> an AI report-writer agent produces a
+# red-team assessment report.
+#
+# This workflow has no Elasticsearch dependency at all — it never reads or
+# writes an ES index. Every "service" it calls (nmap/nuclei/hydra/metasploit)
+# is a custom HTTP microservice (the "Cascavel" services), not an Elastic
+# product. It's included here for completeness since it's an Elastic
+# Workflow file, but making it self-standing means standing up those HTTP
+# services, not Elasticsearch.
+#
+# AUTHORIZATION: this pipeline actively attacks a target (port scanning,
+# vulnerability exploitation, credential brute-forcing, privilege escalation).
+# Only ever point `target`/`consts.target_ip` at a host you are explicitly
+# authorized to test (your own lab VM, a CTF range, an engagement you have
+# written authorization for).
+#
+# PREREQUISITES
+#
+# 1. Four HTTP services reachable at the URLs in `consts` (replace the
+#    `<CASCAVEL_..._HOST>` placeholders), each expecting
+#    `X-Webhook-Secret: {{ consts.webhook_secret }}` and a JSON body, roughly:
+#      nmap_url      POST /scan     { target, options }
+#                     -> { data: { hosts: [...] } }
+#      nuclei_url    POST /scan     { target }
+#                     -> { data: { findings: [...] } }
+#      hydra_url     POST /attack   { target, nmap_hosts }
+#                     -> { data: { ... cracked creds ... } }
+#      metasploit_url POST /exploit  { target, nmap_hosts, nuclei_findings }
+#                      -> { data: { session_id, is_root, uid_output, platform,
+#                                   session_type } }
+#                     POST /linpeas  { session_id }
+#                      -> { data: { findings: [...] } }
+#                     POST /privesc  { session_id, linpeas_findings }
+#                      -> result used only in the final report
+#    These aren't off-the-shelf products — they're thin wrapper APIs this repo
+#    presumably runs in front of real nmap/nuclei/hydra/metasploit-framework
+#    installs (e.g. in containers reachable at those hostnames).
+#
+# 2. consts.webhook_secret: a shared secret the services check on inbound
+#    requests — replace `<WEBHOOK_SECRET>`.
+#
+# 3. consts.target_ip / inputs.target: the IP of the authorized test target.
+#    `inputs.target` overrides the const if the workflow is run with an
+#    input; otherwise consts.target_ip is used.
+#
+# 4. Three Agent Builder agents:
+#      - reaper-attack-planner   given recon data, proposes an exploitation
+#                                 strategy (prefers landing as non-root to
+#                                 demonstrate the full kill chain).
+#      - reaper-privesc-planner  given post-exploitation (LinPEAS) data,
+#                                 recommends a privilege-escalation path.
+#      - reaper-report-writer    given every prior step's output, writes a
+#                                 red-team assessment report using a template
+#                                 in its own instructions.
+#
+# RUN INPUT
+#   inputs.target: optional IP/hostname; falls back to consts.target_ip.
+
+name: Reaper Red Team Pipeline
+enabled: true
+description: >
+  Full kill-chain red team pipeline: reconnaissance (NMAP, Nuclei, Hydra) ->
+  AI attack planning -> initial access (Metasploit) -> post-exploitation
+  enumeration (LinPEAS) -> AI privesc planning -> privilege escalation ->
+  AI-generated assessment report.
+  Triggered manually or via API with a target IP.
+
+consts:
+  nmap_url: "http://<CASCAVEL_NMAP_HOST>:8001"
+  nuclei_url: "http://<CASCAVEL_NUCLEI_HOST>:8002"
+  metasploit_url: "http://<CASCAVEL_METASPLOIT_HOST>:8003"
+  hydra_url: "http://<CASCAVEL_HYDRA_HOST>:8004"
+  webhook_secret: "<WEBHOOK_SECRET>"
+  target_ip: "<TARGET_IP>"
+  attack_planner_agent_id: "reaper-attack-planner"
+  privesc_planner_agent_id: "reaper-privesc-planner"
+  report_agent_id: "reaper-report-writer"
+
+inputs:
+  - name: target
+    type: string
+    required: false
+
+steps:
+  # ==========================================================================
+  # PHASE 1: RECONNAISSANCE
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # STEP 1: NMAP -- Network reconnaissance & service discovery
+  # --------------------------------------------------------------------------
+  - name: nmap_scan
+    type: http
+    with:
+      url: "{{ consts.nmap_url }}/scan"
+      method: POST
+      headers:
+        Content-Type: application/json
+        X-Webhook-Secret: "{{ consts.webhook_secret }}"
+      body:
+        target: "{{ inputs.target | default: consts.target_ip }}"
+        options: "-sV -sC -Pn"
+      timeout: 600s
+    on-failure:
+      continue: false
+
+  # --------------------------------------------------------------------------
+  # STEP 2: Nuclei -- Vulnerability scanning
+  # --------------------------------------------------------------------------
+  - name: nuclei_scan
+    type: http
+    with:
+      url: "{{ consts.nuclei_url }}/scan"
+      method: POST
+      headers:
+        Content-Type: application/json
+        X-Webhook-Secret: "{{ consts.webhook_secret }}"
+      body:
+        target: "http://{{ inputs.target | default: consts.target_ip }}:80"
+      timeout: 600s
+    on-failure:
+      continue: false
+
+  # --------------------------------------------------------------------------
+  # STEP 3: Hydra -- Credential brute-force on discovered services
+  # --------------------------------------------------------------------------
+  - name: hydra_attack
+    type: http
+    with:
+      url: "{{ consts.hydra_url }}/attack"
+      method: POST
+      headers:
+        Content-Type: application/json
+        X-Webhook-Secret: "{{ consts.webhook_secret }}"
+      body:
+        target: "{{ inputs.target | default: consts.target_ip }}"
+        nmap_hosts: "{{ steps.nmap_scan.output.data.hosts }}"
+      timeout: 600s
+    on-failure:
+      continue: true
+
+  # ==========================================================================
+  # PHASE 2: ATTACK PLANNING (AI)
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # STEP 4: Attack Planner Agent -- AI selects the best exploitation strategy
+  # --------------------------------------------------------------------------
+  - name: attack_planner
+    type: ai.agent
+    agent-id: "{{ consts.attack_planner_agent_id }}"
+    with:
+      message: |
+        Analyze the following reconnaissance data and produce an attack plan.
+        Prefer an approach that lands as a NON-ROOT user to demonstrate the
+        full kill chain.
+
+        NMAP SCAN RESULTS (open ports, services, versions):
+        {{ steps.nmap_scan.output.data | json }}
+
+        NUCLEI VULNERABILITY FINDINGS (CVEs, severity):
+        {{ steps.nuclei_scan.output.data | json }}
+
+        HYDRA CREDENTIAL RESULTS (cracked usernames/passwords):
+        {{ steps.hydra_attack.output.data | json }}
+    timeout: 2m
+
+  # ==========================================================================
+  # PHASE 3: INITIAL ACCESS
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # STEP 5: Metasploit -- Exploit target using the agent's plan
+  # --------------------------------------------------------------------------
+  - name: metasploit_exploit
+    type: http
+    with:
+      url: "{{ consts.metasploit_url }}/exploit"
+      method: POST
+      headers:
+        Content-Type: application/json
+        X-Webhook-Secret: "{{ consts.webhook_secret }}"
+      body:
+        target: "{{ inputs.target | default: consts.target_ip }}"
+        nmap_hosts: "{{ steps.nmap_scan.output.data.hosts }}"
+        nuclei_findings: "{{ steps.nuclei_scan.output.data.findings }}"
+      timeout: 300s
+    on-failure:
+      continue: true
+
+  # ==========================================================================
+  # PHASE 4: PRIVILEGE ESCALATION (conditional -- skip if already root)
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # STEP 6: LinPEAS -- Enumerate privesc vectors on compromised box
+  # --------------------------------------------------------------------------
+  - name: linpeas_enum
+    type: http
+    condition: "{{ steps.metasploit_exploit.output.data.is_root == false }}"
+    with:
+      url: "{{ consts.metasploit_url }}/linpeas"
+      method: POST
+      headers:
+        Content-Type: application/json
+        X-Webhook-Secret: "{{ consts.webhook_secret }}"
+      body:
+        session_id: "{{ steps.metasploit_exploit.output.data.session_id }}"
+      timeout: 300s
+    on-failure:
+      continue: true
+
+  # --------------------------------------------------------------------------
+  # STEP 7: Privesc Planner Agent -- AI recommends escalation path
+  # --------------------------------------------------------------------------
+  - name: privesc_planner
+    type: ai.agent
+    condition: "{{ steps.metasploit_exploit.output.data.is_root == false }}"
+    agent-id: "{{ consts.privesc_planner_agent_id }}"
+    with:
+      message: |
+        Analyze the following post-exploitation data and recommend a privilege
+        escalation path to root.
+
+        CURRENT SESSION:
+        - Session ID: {{ steps.metasploit_exploit.output.data.session_id }}
+        - User: {{ steps.metasploit_exploit.output.data.uid_output }}
+        - Platform: {{ steps.metasploit_exploit.output.data.platform }}
+        - Session type: {{ steps.metasploit_exploit.output.data.session_type }}
+
+        LINPEAS FINDINGS:
+        {{ steps.linpeas_enum.output.data | json }}
+    timeout: 2m
+
+  # --------------------------------------------------------------------------
+  # STEP 8: Metasploit local exploit -- Escalate to root
+  # --------------------------------------------------------------------------
+  - name: metasploit_privesc
+    type: http
+    condition: "{{ steps.metasploit_exploit.output.data.is_root == false }}"
+    with:
+      url: "{{ consts.metasploit_url }}/privesc"
+      method: POST
+      headers:
+        Content-Type: application/json
+        X-Webhook-Secret: "{{ consts.webhook_secret }}"
+      body:
+        session_id: "{{ steps.metasploit_exploit.output.data.session_id }}"
+        linpeas_findings: "{{ steps.linpeas_enum.output.data.findings }}"
+      timeout: 300s
+    on-failure:
+      continue: true
+
+  # ==========================================================================
+  # PHASE 5: REPORTING
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # STEP 9: Report Writer Agent -- AI-generated assessment report
+  # --------------------------------------------------------------------------
+  - name: generate_report
+    type: ai.agent
+    agent-id: "{{ consts.report_agent_id }}"
+    with:
+      message: |
+        Write a red team assessment report using the template in your instructions.
+        This engagement followed a full kill chain: reconnaissance, credential
+        attacks, AI-planned exploitation, initial access, privilege escalation
+        enumeration, and escalation to root.
+
+        NMAP SCAN RESULTS:
+        {{ steps.nmap_scan.output.data | json }}
+
+        NUCLEI VULNERABILITY FINDINGS:
+        {{ steps.nuclei_scan.output.data | json }}
+
+        HYDRA CREDENTIAL RESULTS:
+        {{ steps.hydra_attack.output.data | json }}
+
+        ATTACK PLANNER STRATEGY:
+        {{ steps.attack_planner.output.data | json }}
+
+        METASPLOIT INITIAL ACCESS:
+        {{ steps.metasploit_exploit.output.data | json }}
+
+        LINPEAS ENUMERATION:
+        {{ steps.linpeas_enum.output.data | json }}
+
+        PRIVESC PLANNER RECOMMENDATION:
+        {{ steps.privesc_planner.output.data | json }}
+
+        PRIVILEGE ESCALATION RESULT:
+        {{ steps.metasploit_privesc.output.data | json }}
+    timeout: 5m

