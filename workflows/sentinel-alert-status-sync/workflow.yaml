@@ -1,40 +1,5 @@
 # Elastic to Sentinel alert status sync
 #
-# Source: elastic-sentinel-integration
-# (config/kibana/workflows/sentinel-alert-status-sync.yaml.tftpl)
-#
-# This is the one that keeps alert status in sync between Elastic Security and
-# Microsoft Sentinel: every minute it finds Elastic alerts an analyst just
-# acknowledged or closed and pushes the matching status (+ close
-# classification) onto the corresponding Sentinel incident.
-#
-# This file was originally a Terraform template (`.tftpl`), rendered by
-# `terraform/elastic_workflows.tf` with 4 substitutions:
-#   ${workflow_name}     -> "sentinel-alert-status-sync"
-#   ${incidents_url}      -> ARM REST URL for the Sentinel workspace's
-#                            incidents collection, e.g.
-#       https://management.azure.com/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.OperationalInsights/workspaces/<workspace>/providers/Microsoft.SecurityInsights/incidents
-#   ${rule_names_json}   -> JSON array of detection rule names whose alerts
-#                            should be synced, e.g. ["Microsoft Sentinel Incident Raised"]
-#   ${connector_id}      -> the id of the Kibana HTTP connector below (step 3)
-# Below, those are left as literal placeholders — replace them before
-# uploading this workflow definition to Kibana.
-#
-# WHAT THIS DOES (the actual sync logic)
-# 1. Search `.alerts-security.alerts-default` for alerts from the named
-#    rule(s) whose workflow_status is acknowledged/closed and was updated in
-#    the last 3 minutes.
-# 2. For each changed alert that carries a Sentinel incident name
-#    (`azure.eventhub.IncidentName` — i.e. it originated from a Sentinel
-#    incident ingested via the eventhub pipeline), GET the current incident
-#    from Sentinel, and if its status isn't already the target status, PUT it
-#    back with status set to Active/Closed and, if closing, a classification
-#    derived from the alert's close reason (true/false/benign positive ->
-#    TruePositive/FalsePositive/BenignPositive, else Undetermined).
-# 3. Incidents already in the target state, or alerts with no incident name,
-#    are left alone (`on-failure: continue: true` on both HTTP steps so one
-#    bad incident doesn't stop the batch).
-#
 # PREREQUISITES
 #
 # 1. Elastic Security enabled, alerting on Sentinel-sourced data, so that
